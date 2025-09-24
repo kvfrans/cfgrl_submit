@@ -6,3 +6,9 @@ dist/
 .DS_Store
 .idea/
 .ruff_cache/
+
+*.sh
+make_sbatch
+exp
+ipynbs
+data

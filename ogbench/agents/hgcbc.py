@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any
 
 import flax
@@ -5,10 +6,9 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor
+from utils.networks import GCActor, GCDiscreteActor, MLP
 
 
 class HGCBCAgent(flax.struct.PyTreeNode):
@@ -28,9 +28,14 @@ class HGCBCAgent(flax.struct.PyTreeNode):
         actor_info = {
             'actor_loss': actor_loss,
             'bc_log_prob': log_prob.mean(),
-            'mse': jnp.mean((dist.mode() - batch['high_actor_actions']) ** 2),
-            'std': jnp.mean(dist.scale_diag),
         }
+        if not self.config['discrete']:
+            actor_info.update(
+                {
+                    'mse': jnp.mean((dist.mode() - batch['high_actor_actions']) ** 2),
+                    'std': jnp.mean(dist.scale_diag),
+                }
+            )
 
         return actor_loss, actor_info
 
@@ -44,9 +49,14 @@ class HGCBCAgent(flax.struct.PyTreeNode):
         actor_info = {
             'actor_loss': actor_loss,
             'bc_log_prob': log_prob.mean(),
-            'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
-            'std': jnp.mean(dist.scale_diag),
         }
+        if not self.config['discrete']:
+            actor_info.update(
+                {
+                    'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
+                    'std': jnp.mean(dist.scale_diag),
+                }
+            )
 
         return actor_loss, actor_info
 
@@ -81,24 +91,28 @@ class HGCBCAgent(flax.struct.PyTreeNode):
 
         return self.replace(network=new_network, rng=new_rng), info
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=('use_subgoal',))
     def sample_actions(
         self,
         observations,
         goals=None,
+        subgoals=None,
         seed=None,
         temperature=1.0,
+        use_subgoal=False,
     ):
         """Sample actions from the actor."""
         high_seed, low_seed = jax.random.split(seed)
 
-        high_dist = self.network.select('high_actor')(observations, goals, temperature=temperature)
-        subgoals = high_dist.sample(seed=high_seed)
+        if not use_subgoal:
+            high_dist = self.network.select('high_actor')(observations, goals, temperature=temperature)
+            subgoals = high_dist.sample(seed=high_seed)
 
         low_dist = self.network.select('low_actor')(observations, subgoals, temperature=temperature)
         actions = low_dist.sample(seed=low_seed)
 
-        actions = jnp.clip(actions, -1, 1)
+        if not self.config['discrete']:
+            actions = jnp.clip(actions, -1, 1)
 
         return actions
 
@@ -119,9 +133,12 @@ class HGCBCAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
+        assert not config['discrete']
+
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
         ex_goals = example_batch['high_actor_goals']
+        ob_dim = ex_observations.shape[-1]
         action_dim = ex_actions.shape[-1]
         goal_dim = ex_goals.shape[-1]
 
@@ -135,7 +152,7 @@ class HGCBCAgent(flax.struct.PyTreeNode):
         # Define actor networks.
         high_actor_def = GCActor(
             hidden_dims=config['actor_hidden_dims'],
-            action_dim=goal_dim,
+            action_dim=ob_dim if config['high_action_type'] == 'full' else goal_dim,
             state_dependent_std=False,
             const_std=config['const_std'],
             gc_encoder=encoders.get('high_actor'),
@@ -151,10 +168,7 @@ class HGCBCAgent(flax.struct.PyTreeNode):
 
         network_info = dict(
             high_actor=(high_actor_def, (ex_observations, ex_goals)),
-            low_actor=(
-                low_actor_def,
-                (ex_observations, ex_goals),
-            ),
+            low_actor=(low_actor_def, (ex_observations, ex_observations if config['high_action_type'] == 'full' else ex_goals)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -178,10 +192,12 @@ def get_config():
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
             discount=0.99,  # Discount factor (unused by default; can be used for geometric goal sampling in GCDataset).
             const_std=True,  # Whether to use constant standard deviation for the actor.
+            discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             # Dataset hyperparameters.
             dataset_class='HGCDataset',  # Dataset class name.
             subgoal_steps=25,  # Subgoal steps.
+            high_action_type='standard',  # Type of high-level actions.
             value_p_curgoal=0.0,  # Unused (defined for compatibility with GCDataset).
             value_p_trajgoal=1.0,  # Unused (defined for compatibility with GCDataset).
             value_p_randomgoal=0.0,  # Unused (defined for compatibility with GCDataset).

@@ -5,10 +5,9 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor
+from utils.networks import GCActor, GCDiscreteActor
 
 
 class GCBCAgent(flax.struct.PyTreeNode):
@@ -20,7 +19,7 @@ class GCBCAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the BC actor loss."""
-        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'] if self.config['gc'] else jnp.zeros_like(batch['actor_goals']), params=grad_params)
         log_prob = dist.log_prob(batch['actions'])
 
         actor_loss = -log_prob.mean()
@@ -28,9 +27,14 @@ class GCBCAgent(flax.struct.PyTreeNode):
         actor_info = {
             'actor_loss': actor_loss,
             'bc_log_prob': log_prob.mean(),
-            'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
-            'std': jnp.mean(dist.scale_diag),
         }
+        if not self.config['discrete']:
+            actor_info.update(
+                {
+                    'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
+                    'std': jnp.mean(dist.scale_diag),
+                }
+            )
 
         return actor_loss, actor_info
 
@@ -69,9 +73,10 @@ class GCBCAgent(flax.struct.PyTreeNode):
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        dist = self.network.select('actor')(observations, goals if self.config['gc'] else jnp.zeros_like(goals), temperature=temperature)
         actions = dist.sample(seed=seed)
-        actions = jnp.clip(actions, -1, 1)
+        if not self.config['discrete']:
+            actions = jnp.clip(actions, -1, 1)
         return actions
 
     @classmethod
@@ -85,7 +90,8 @@ class GCBCAgent(flax.struct.PyTreeNode):
 
         Args:
             seed: Random seed.
-            example_batch: Example batch.
+            ex_observations: Example batch of observations.
+            ex_actions: Example batch of actions. In discrete-action MDPs, this should contain the maximum action value.
             config: Configuration dictionary.
         """
         rng = jax.random.PRNGKey(seed)
@@ -94,7 +100,11 @@ class GCBCAgent(flax.struct.PyTreeNode):
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
         ex_goals = example_batch['value_goals']
-        action_dim = ex_actions.shape[-1]
+
+        if config['discrete']:
+            action_dim = ex_actions.max() + 1
+        else:
+            action_dim = ex_actions.shape[-1]
 
         # Define encoder.
         encoders = dict()
@@ -103,13 +113,20 @@ class GCBCAgent(flax.struct.PyTreeNode):
             encoders['actor'] = GCEncoder(state_encoder=encoder_module())  # For oraclerep.
 
         # Define actor network.
-        actor_def = GCActor(
-            hidden_dims=config['actor_hidden_dims'],
-            action_dim=action_dim,
-            state_dependent_std=False,
-            const_std=config['const_std'],
-            gc_encoder=encoders.get('actor'),
-        )
+        if config['discrete']:
+            actor_def = GCDiscreteActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=action_dim,
+                gc_encoder=encoders.get('actor'),
+            )
+        else:
+            actor_def = GCActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=action_dim,
+                state_dependent_std=False,
+                const_std=config['const_std'],
+                gc_encoder=encoders.get('actor'),
+            )
 
         network_info = dict(
             actor=(actor_def, (ex_observations, ex_goals)),
@@ -135,7 +152,9 @@ def get_config():
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             discount=0.99,  # Discount factor (unused by default; can be used for geometric goal sampling in GCDataset).
             const_std=True,  # Whether to use constant standard deviation for the actor.
+            discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            gc=True,  # Goal-conditioned.
             # Dataset hyperparameters.
             dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Unused (defined for compatibility with GCDataset).

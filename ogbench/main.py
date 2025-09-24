@@ -3,17 +3,26 @@ import os
 import random
 import time
 from collections import defaultdict
+import platform
+
+if 'mac' in platform.platform():
+    # macOS doesn't support EGL.
+    pass
+else:
+    os.environ['MUJOCO_GL'] = 'egl'
+    if 'SLURM_STEP_GPUS' in os.environ:
+        os.environ['EGL_DEVICE_ID'] = os.environ['SLURM_STEP_GPUS']
+        os.environ['MUJOCO_EGL_DEVICE_ID'] = os.environ['SLURM_STEP_GPUS']
 
 import jax
 import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
-from ml_collections import config_flags
-
 from agents import agents
+from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
-from utils.env_utils import make_gc_env_and_datasets
+from utils.env_utils import make_env_and_datasets, make_gc_env_and_datasets
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
@@ -22,25 +31,26 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
-flags.DEFINE_string('env_name', 'antmaze-large-navigate-oraclerep-v0', 'Environment (dataset) name.')
+flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
+flags.DEFINE_integer('goal_conditioned', 1, 'Whether to do goal-conditioned RL.')
 
-flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
-flags.DEFINE_integer('log_interval', 10000, 'Logging interval.')
-flags.DEFINE_integer('eval_interval', 500000, 'Evaluation interval.')
+flags.DEFINE_integer('train_steps', 1_000_000, 'Number of training steps.')
+flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
+flags.DEFINE_integer('eval_interval', 200_000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
-flags.DEFINE_integer('eval_episodes', 15, 'Number of episodes for each task.')
+flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
 flags.DEFINE_float('eval_temperature', 0, 'Actor temperature for evaluation.')
 flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.')
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
-flags.DEFINE_integer('eval_on_cpu', 0, 'Whether to evaluate on CPU.')
+flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
-config_flags.DEFINE_config_file('agent', 'agents/cfgrl.py', lock_config=False)
+config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 
 def main(_):
@@ -56,15 +66,19 @@ def main(_):
 
     # Set up environment and dataset.
     config = FLAGS.agent
-    env, train_dataset, val_dataset = make_gc_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    if FLAGS.goal_conditioned:
+        env, train_dataset, val_dataset = make_gc_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    else:
+        env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config.get('frame_stack'))
 
-    dataset_class = {
-        'GCDataset': GCDataset,
-        'HGCDataset': HGCDataset,
-    }[config['dataset_class']]
-    train_dataset = dataset_class(Dataset.create(**train_dataset), config)
-    if val_dataset is not None:
-        val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+    if FLAGS.goal_conditioned:
+        dataset_class = {
+            'GCDataset': GCDataset,
+            'HGCDataset': HGCDataset,
+        }[config['dataset_class']]
+        train_dataset = dataset_class(Dataset.create(**train_dataset), config)
+        if val_dataset is not None:
+            val_dataset = dataset_class(Dataset.create(**val_dataset), config)
 
     # Initialize agent.
     random.seed(FLAGS.seed)
@@ -108,43 +122,90 @@ def main(_):
 
         # Evaluate agent.
         if i % FLAGS.eval_interval == 0:
-            eval_metrics = {}
-            if FLAGS.eval_on_cpu:
-                eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
+            if config['agent_name'] in ['flowgcbc', 'cfgbc', 'hflowgcbc', 'hcfgbc']:
+                exps = [
+                    ('cfg0.5', {'cfg': 0.5}),
+                    ('cfg1', {'cfg': 1.0}),
+                    ('cfg1.25', {'cfg': 1.25}),
+                    ('cfg1.5', {'cfg': 1.5}),
+                    ('cfg2.0', {'cfg': 2.0}),
+                    ('cfg3.0', {'cfg': 3.0}),
+                ]
+            elif config['agent_name'] in ['flowgcivl', 'cfggcivl', 'flowivl', 'cfgivl', 'flowiql', 'cfgiql']:
+                exps = [
+                    ('cfg0.5', {'cfg': 0.5}),
+                    ('cfg1', {'cfg': 1.0}),
+                    ('cfg1.25', {'cfg': 1.25}),
+                    ('cfg1.5', {'cfg': 1.5}),
+                    ('cfg2.0', {'cfg': 2.0}),
+                    ('cfg3.0', {'cfg': 3.0}),
+                ]
             else:
-                eval_agent = agent
-            renders = []
-            overall_metrics = defaultdict(list)
-            task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
-            num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
-            for task_id in tqdm.trange(1, num_tasks + 1):
-                task_name = task_infos[task_id - 1]['task_name']
-                eval_info, trajs, cur_renders = evaluate(
-                    agent=eval_agent,
-                    env=env,
-                    task_id=task_id,
-                    config=config,
-                    num_eval_episodes=FLAGS.eval_episodes,
-                    num_video_episodes=FLAGS.video_episodes,
-                    video_frame_skip=FLAGS.video_frame_skip,
-                    eval_temperature=FLAGS.eval_temperature,
-                    eval_gaussian=FLAGS.eval_gaussian,
-                )
-                renders.extend(cur_renders)
-                metric_names = ['success']
-                eval_metrics.update(
-                    {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
-                )
-                for k, v in eval_info.items():
-                    if k in metric_names:
-                        overall_metrics[k].append(v)
+                exps = [
+                    ('standard', {}),
+                ]
 
-            for k, v in overall_metrics.items():
-                eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
+            eval_metrics = {}
+            for name, agent_args in exps:
+                if FLAGS.eval_on_cpu:
+                    eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
+                else:
+                    eval_agent = agent
+                renders = []
+                if FLAGS.goal_conditioned:
+                    overall_metrics = defaultdict(list)
+                    task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
+                    num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
+                    for task_id in tqdm.trange(1, num_tasks + 1):
+                        task_name = task_infos[task_id - 1]['task_name']
+                        eval_info, trajs, cur_renders = evaluate(
+                            agent=eval_agent,
+                            agent_args=agent_args,
+                            env=env,
+                            goal_conditioned=FLAGS.goal_conditioned,
+                            task_id=task_id,
+                            config=config,
+                            num_eval_episodes=FLAGS.eval_episodes,
+                            num_video_episodes=FLAGS.video_episodes,
+                            video_frame_skip=FLAGS.video_frame_skip,
+                            eval_temperature=FLAGS.eval_temperature,
+                            eval_gaussian=FLAGS.eval_gaussian,
+                            name=name,
+                        )
+                        renders.extend(cur_renders)
+                        metric_names = ['success']
+                        eval_metrics.update(
+                            {f'evaluation/{name}/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
+                        )
+                        for k, v in eval_info.items():
+                            if k in metric_names:
+                                overall_metrics[k].append(v)
 
-            if FLAGS.video_episodes > 0:
-                video = get_wandb_video(renders=renders)
-                eval_metrics['evaluation/video'] = video
+                    for k, v in overall_metrics.items():
+                        eval_metrics[f'evaluation/{name}/overall_{k}'] = np.mean(v)
+                        eval_metrics[f'evaluation_all/{name}_{k}'] = np.mean(v)
+                else:
+                    eval_info, trajs, cur_renders = evaluate(
+                        agent=eval_agent,
+                        agent_args=agent_args,
+                        env=env,
+                        goal_conditioned=FLAGS.goal_conditioned,
+                        config=config,
+                        num_eval_episodes=FLAGS.eval_episodes,
+                        num_video_episodes=FLAGS.video_episodes,
+                        video_frame_skip=FLAGS.video_frame_skip,
+                        eval_temperature=FLAGS.eval_temperature,
+                        eval_gaussian=FLAGS.eval_gaussian,
+                        name=name,
+                    )
+                    renders.extend(cur_renders)
+                    for k, v in eval_info.items():
+                        eval_metrics[f'evaluation/{name}/{k}'] = v
+                        eval_metrics[f'evaluation_all/{name}_{k}'] = np.mean(v)
+
+                if FLAGS.video_episodes > 0:
+                    video = get_wandb_video(renders=renders)
+                    eval_metrics[f'evaluation/{name}/video'] = video
 
             wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)

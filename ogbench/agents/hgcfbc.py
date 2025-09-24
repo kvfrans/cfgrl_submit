@@ -1,14 +1,15 @@
+from functools import partial
 from typing import Any
 
 import flax
 import jax
 import jax.numpy as jnp
 import ml_collections
+import numpy as np
 import optax
-
-from utils.encoders import encoder_modules
+from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActorVectorField
+from utils.networks import GCActor, GCDiscreteActor, MLP, GCActorVectorField
 
 
 class HGCFBCAgent(flax.struct.PyTreeNode):
@@ -29,9 +30,7 @@ class HGCFBCAgent(flax.struct.PyTreeNode):
         x_t = (1 - t) * x_0 + t * x_1
         y = x_1 - x_0
 
-        pred = self.network.select('high_actor_flow')(
-            batch['observations'], x_t, t, batch['high_actor_goals'], params=grad_params
-        )
+        pred = self.network.select('high_actor_flow')(batch['observations'], x_t, t, batch['high_actor_goals'], params=grad_params)
 
         actor_loss = jnp.mean((pred - y) ** 2)
 
@@ -52,9 +51,7 @@ class HGCFBCAgent(flax.struct.PyTreeNode):
         x_t = (1 - t) * x_0 + t * x_1
         y = x_1 - x_0
 
-        pred = self.network.select('low_actor_flow')(
-            batch['observations'], x_t, t, batch['low_actor_goals'], params=grad_params
-        )
+        pred = self.network.select('low_actor_flow')(batch['observations'], x_t, t, batch['low_actor_goals'], params=grad_params)
 
         actor_loss = jnp.mean((pred - y) ** 2)
 
@@ -95,23 +92,37 @@ class HGCFBCAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
+    def compute_metrics(self, batch, rng=None):
+        actions, _ = self.sample_actions(batch['observations'], batch['high_actor_goals'], seed=rng)
+        mse = jnp.mean((actions - batch['actions']) ** 2)
+
+        info = {
+            'mse': mse,
+        }
+
+        return info
+
+    @partial(jax.jit, static_argnames=('use_subgoal',))
     def sample_actions(
         self,
         observations,
         goals=None,
+        subgoals=None,
         seed=None,
         temperature=1.0,
+        use_subgoal=False,
     ):
         """Sample actions from the actor."""
         high_seed, low_seed = jax.random.split(seed)
 
-        subgoals = jax.random.normal(high_seed, (*observations.shape[:-1], self.config['goal_dim']))
-        for i in range(self.config['flow_steps']):
-            t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
-            vels = self.network.select('high_actor_flow')(observations, subgoals, t, goals)
-            subgoals = subgoals + vels / self.config['flow_steps']
+        if not use_subgoal:
+            subgoals = jax.random.normal(high_seed, (*observations.shape[:-1], self.config['ob_dim'] if self.config['high_action_type'] == 'full' else self.config['goal_dim'],))
+            for i in range(self.config['flow_steps']):
+                t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
+                vels = self.network.select('high_actor_flow')(observations, subgoals, t, goals)
+                subgoals = subgoals + vels / self.config['flow_steps']
 
-        actions = jax.random.normal(low_seed, (*observations.shape[:-1], self.config['action_dim']))
+        actions = jax.random.normal(low_seed, (*observations.shape[:-1], self.config['action_dim'],))
         for i in range(self.config['flow_steps']):
             t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
             vels = self.network.select('low_actor_flow')(observations, actions, t, subgoals)
@@ -138,6 +149,8 @@ class HGCFBCAgent(flax.struct.PyTreeNode):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
+        assert not config['discrete']
+
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
         ex_goals = example_batch['high_actor_goals']
@@ -155,18 +168,20 @@ class HGCFBCAgent(flax.struct.PyTreeNode):
         # Define actor networks.
         high_actor_flow_def = GCActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
-            action_dim=goal_dim,
+            action_dim=ob_dim if config['high_action_type'] == 'full' else goal_dim,
             layer_norm=config['actor_layer_norm'],
+            # gc_encoder=encoders.get('high_actor_flow'),
         )
         low_actor_flow_def = GCActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
             action_dim=action_dim,
             layer_norm=config['actor_layer_norm'],
+            # gc_encoder=encoders.get('low_actor_flow'),
         )
 
         network_info = dict(
-            high_actor_flow=(high_actor_flow_def, (ex_observations, ex_goals, ex_times, ex_goals)),
-            low_actor_flow=(low_actor_flow_def, (ex_observations, ex_actions, ex_times, ex_goals)),
+            high_actor_flow=(high_actor_flow_def, (ex_observations, ex_observations if config['high_action_type'] == 'full' else ex_goals, ex_times, ex_goals)),
+            low_actor_flow=(low_actor_flow_def, (ex_observations, ex_actions, ex_times, ex_observations if config['high_action_type'] == 'full' else ex_goals)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -189,17 +204,20 @@ def get_config():
             agent_name='hgcfbc',  # Agent name.
             lr=3e-4,  # Learning rate.
             batch_size=1024,  # Batch size.
+            mlp_class='mlp',  # MLP class.
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
             discount=0.99,  # Discount factor (unused by default; can be used for geometric goal sampling in GCDataset).
-            flow_steps=16,  # Number of flow steps.
+            discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             ob_dim=ml_collections.config_dict.placeholder(int),  # Observation dimension (will be set automatically).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
             goal_dim=ml_collections.config_dict.placeholder(int),  # Goal dimension (will be set automatically).
+            flow_steps=16,  # Number of flow steps.
             # Dataset hyperparameters.
             dataset_class='HGCDataset',  # Dataset class name.
             subgoal_steps=25,  # Subgoal steps.
+            high_action_type='standard',  # Type of high-level actions.
             value_p_curgoal=0.0,  # Unused (defined for compatibility with GCDataset).
             value_p_trajgoal=1.0,  # Unused (defined for compatibility with GCDataset).
             value_p_randomgoal=0.0,  # Unused (defined for compatibility with GCDataset).

@@ -4,11 +4,11 @@ import flax
 import jax
 import jax.numpy as jnp
 import ml_collections
+import numpy as np
 import optax
-
-from utils.encoders import encoder_modules
+from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActorVectorField
+from utils.networks import GCActor, GCDiscreteActor, MLP, GCActorVectorField
 
 
 class GCFBCAgent(flax.struct.PyTreeNode):
@@ -29,9 +29,7 @@ class GCFBCAgent(flax.struct.PyTreeNode):
         x_t = (1 - t) * x_0 + t * x_1
         y = x_1 - x_0
 
-        pred = self.network.select('actor_flow')(
-            batch['observations'], x_t, t, batch['actor_goals'], params=grad_params
-        )
+        pred = self.network.select('actor_flow')(batch['observations'], x_t, t, batch['actor_goals'] if self.config['gc'] else jnp.zeros_like(batch['actor_goals']), params=grad_params)
 
         actor_loss = jnp.mean((pred - y) ** 2)
 
@@ -68,6 +66,17 @@ class GCFBCAgent(flax.struct.PyTreeNode):
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
+    def compute_metrics(self, batch, rng=None):
+        actions = self.sample_actions(batch['observations'], batch['actor_goals'] if self.config['gc'] else jnp.zeros_like(batch['actor_goals']), seed=rng)
+        mse = jnp.mean((actions - batch['actions']) ** 2)
+
+        info = {
+            'mse': mse,
+        }
+
+        return info
+
+    @jax.jit
     def sample_actions(
         self,
         observations,
@@ -78,16 +87,10 @@ class GCFBCAgent(flax.struct.PyTreeNode):
         """Sample actions from the actor."""
         if self.config['encoder'] is not None:
             observations = self.network.select('actor_flow_encoder')(observations)
-        actions = jax.random.normal(
-            seed,
-            (
-                *observations.shape[:-1],
-                self.config['action_dim'],
-            ),
-        )
+        actions = jax.random.normal(seed, (*observations.shape[:-1], self.config['action_dim'],))
         for i in range(self.config['flow_steps']):
             t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
-            vels = self.network.select('actor_flow')(observations, actions, t, goals, is_encoded=True)
+            vels = self.network.select('actor_flow')(observations, actions, t, goals if self.config['gc'] else jnp.zeros_like(goals), is_encoded=True)
             actions = actions + vels / self.config['flow_steps']
         actions = jnp.clip(actions, -1, 1)
         return actions
@@ -108,6 +111,8 @@ class GCFBCAgent(flax.struct.PyTreeNode):
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
+
+        assert not config['discrete']
 
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
@@ -157,9 +162,11 @@ def get_config():
             actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
             discount=0.99,  # Discount factor (unused by default; can be used for geometric goal sampling in GCDataset).
-            flow_steps=16,  # Number of flow steps.
+            discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
+            flow_steps=16,  # Number of flow steps.
+            gc=True,  # Goal-conditioned.
             # Dataset hyperparameters.
             dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Unused (defined for compatibility with GCDataset).

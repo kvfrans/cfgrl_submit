@@ -4,6 +4,8 @@ import jax
 import numpy as np
 from tqdm import trange
 
+import wandb
+import matplotlib.pyplot as plt
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
     """Helper function to split the random number generator key before each call to the function."""
@@ -37,6 +39,8 @@ def add_to(dict_of_lists, single_dict):
 def evaluate(
     agent,
     env,
+    goal_conditioned=False,
+    agent_args={},
     task_id=None,
     config=None,
     num_eval_episodes=50,
@@ -44,12 +48,14 @@ def evaluate(
     video_frame_skip=3,
     eval_temperature=0,
     eval_gaussian=None,
+    name='base',
 ):
     """Evaluate the agent in the environment.
 
     Args:
         agent: Agent.
         env: Environment.
+        goal_conditioned: Whether to do goal-conditioned evaluation.
         task_id: Task ID to be passed to the environment.
         config: Configuration dictionary.
         num_eval_episodes: Number of episodes to evaluate the agent.
@@ -65,23 +71,30 @@ def evaluate(
     trajs = []
     stats = defaultdict(list)
 
+
     renders = []
     for i in trange(num_eval_episodes + num_video_episodes):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
-        observation, info = env.reset(options=dict(task_id=task_id, render_goal=should_render))
-        goal = info.get('goal')
-        goal_frame = info.get('goal_rendered')
+        if goal_conditioned:
+            observation, info = env.reset(options=dict(task_id=task_id, render_goal=should_render))
+            goal = info.get('goal')
+            goal_frame = info.get('goal_rendered')
+        else:
+            observation, info = env.reset()
+            goal = None
+            goal_frame = None
         done = False
         step = 0
         render = []
         while not done:
-            action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
+            action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature, **agent_args)
             action = np.array(action)
-            if eval_gaussian is not None:
-                action = np.random.normal(action, eval_gaussian)
-            action = np.clip(action, -1, 1)
+            if not config.get('discrete'):
+                if eval_gaussian is not None:
+                    action = np.random.normal(action, eval_gaussian)
+                action = np.clip(action, -1, 1)
 
             next_observation, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated

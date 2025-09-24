@@ -537,13 +537,12 @@ class GCActorVectorField(nn.Module):
 
     @nn.compact
     def __call__(self, observations, actions, times, goals=None, is_encoded=False):
-        """Return the vectors at the given states, actions, and times, and goals (optional).
+        """Return the vectors at the given states, actions, and times (optional).
 
         Args:
             observations: Observations.
             actions: Actions.
-            times: Times.
-            goals: Goals (optional).
+            times: Times (optional).
             is_encoded: Whether the observations are already encoded.
         """
         if self.encoder is not None and not is_encoded:
@@ -555,13 +554,18 @@ class GCActorVectorField(nn.Module):
         v = self.mlp(inputs)
         return v
 
-
 class UnconditionalEmbedding(nn.Module):
-    """Unconditional embedding module."""
-
     goal_dim: int
 
     @nn.compact
     def __call__(self):
         embed = nn.Embed(1, self.goal_dim)
         return embed(jnp.zeros(1, dtype=jnp.uint8))
+    
+class IsPositiveEmbedding(nn.Module):
+    emb_dim: int
+
+    @nn.compact
+    def __call__(self, val): # [null, negative, positive]
+        embed = nn.Embed(3, self.emb_dim)
+        return embed(val)
